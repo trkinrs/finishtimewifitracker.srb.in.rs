@@ -1,0 +1,794 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RSSI Peak Replay</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f4;
+      --text: #20211f;
+      --muted: #596056;
+      --line: #d9ded6;
+      --panel: #ffffff;
+      --blue: #1f6feb;
+      --red: #d1242f;
+      --gold: #7a5c00;
+      --green: #1a7f37;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 16px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    h1 { margin: 0; font-size: 28px; }
+    .meta { color: var(--muted); font-size: 14px; line-height: 1.4; }
+    .toolbar {
+      display: flex;
+      align-items: end;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding: 12px 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 12px;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      font-weight: 650;
+      min-width: 130px;
+    }
+    input, button {
+      font: inherit;
+      padding: 8px;
+    }
+    input[type="range"] {
+      width: 150px;
+      padding: 0;
+    }
+    input[type="file"] {
+      max-width: 290px;
+    }
+    button, a { color: #095f83; }
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin: 10px 0;
+      font-size: 14px;
+    }
+    .stats div {
+      padding-right: 14px;
+      border-right: 1px solid var(--line);
+    }
+    .stats div:last-child { border-right: 0; }
+    #graph {
+      width: 100%;
+      min-height: 440px;
+      border: 1px solid #b8bdb4;
+      background: var(--panel);
+      display: block;
+    }
+    .error {
+      color: #9a3412;
+      font-weight: 650;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .key {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .swatch {
+      width: 22px;
+      height: 3px;
+      display: inline-block;
+      background: currentColor;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>RSSI Peak Replay</h1>
+      <div class="meta">Upload receiver CSV, adjust filtering and peak rules, then compare detected peak time.</div>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <label>
+      CSV file
+      <input id="fileInput" type="file" accept=".csv,text/csv">
+    </label>
+    <label>
+      SMA samples <output id="avgOut">3</output>
+      <input id="avgInput" type="range" min="1" max="12" value="3">
+    </label>
+    <label>
+      EMA alpha % <output id="emaOut">50</output>
+      <input id="emaInput" type="range" min="1" max="100" value="50">
+    </label>
+    <label>
+      Min rise dB <output id="riseOut">6</output>
+      <input id="riseInput" type="range" min="1" max="30" value="6">
+    </label>
+    <label>
+      Min drop dB <output id="dropOut">5</output>
+      <input id="dropInput" type="range" min="1" max="30" value="5">
+    </label>
+    <label>
+      Drop readings <output id="dropReadingsOut">3</output>
+      <input id="dropReadingsInput" type="range" min="1" max="20" value="3">
+    </label>
+  </div>
+
+  <div id="status" class="stats">
+    <div>Waiting for CSV</div>
+  </div>
+
+  <svg id="graph" viewBox="0 0 1100 520" role="img" aria-label="RSSI replay graph"></svg>
+
+  <div class="legend meta">
+    <span class="key" style="color: var(--blue)"><span class="swatch"></span>Raw RSSI</span>
+    <span class="key" style="color: var(--green)"><span class="swatch"></span>SMA</span>
+    <span class="key" style="color: var(--red)"><span class="swatch"></span>EMA filtered</span>
+    <span class="key" style="color: #7c3aed"><span class="swatch"></span>Armed</span>
+    <span class="key" style="color: var(--gold)"><span class="swatch"></span>Detected peak</span>
+  </div>
+
+  <script>
+    class PeakDetector {
+      constructor() {
+        this.configure({
+          movingAverageMeasurements: 3,
+          emaAlphaPercent: 50,
+          peakArmRiseDb: 6,
+          peakDropDb: 5,
+          requiredDropReadings: 3,
+          learnMode: false
+        });
+        this.reset(0);
+      }
+
+      configure(config) {
+        this.config = {
+          movingAverageMeasurements: clampInt(config.movingAverageMeasurements, 1, 12),
+          emaAlphaPercent: clampInt(config.emaAlphaPercent, 1, 100),
+          peakArmRiseDb: clampInt(config.peakArmRiseDb, 1, 30),
+          peakDropDb: clampInt(config.peakDropDb, 1, 30),
+          requiredDropReadings: Math.max(1, clampInt(config.requiredDropReadings, 1, 20)),
+          learnMode: Boolean(config.learnMode)
+        };
+      }
+
+      reset(startMs) {
+        this.recent = new Array(12).fill(0);
+        this.recentCount = 0;
+        this.recentNext = 0;
+        this.hasRssiValue = false;
+        this.emaReady = false;
+        this.smaValue = -100;
+        this.smoothValue = -100;
+        this.baselineValue = -100;
+        this.peakValue = -100;
+        this.peakMsValue = startMs;
+        this.dropReadingCount = 0;
+        this.armed = false;
+      }
+
+      process(timeMs, rawRssi) {
+        this.smaValue = this.movingAverage(rawRssi);
+        if (!this.emaReady) {
+          this.smoothValue = this.smaValue;
+          this.emaReady = true;
+        } else {
+          const alpha = this.config.emaAlphaPercent / 100;
+          this.smoothValue = alpha * this.smaValue + (1 - alpha) * this.smoothValue;
+        }
+
+        if (!this.hasRssiValue) {
+          this.hasRssiValue = true;
+          this.baselineValue = this.smoothValue;
+          this.peakValue = this.smoothValue;
+          this.peakMsValue = timeMs;
+          return this.result(rawRssi, false);
+        }
+
+        if (this.smoothValue >= this.peakValue) {
+          this.peakValue = this.smoothValue;
+          this.peakMsValue = timeMs;
+          if ((this.peakValue - this.baselineValue) >= this.config.peakArmRiseDb) {
+            this.armed = true;
+          }
+          this.dropReadingCount = 0;
+          return this.result(rawRssi, false);
+        }
+
+        if (!this.armed) {
+          return this.result(rawRssi, false);
+        }
+
+        if ((this.peakValue - this.smoothValue) >= this.config.peakDropDb) {
+          this.dropReadingCount++;
+        } else if (this.dropReadingCount > 0) {
+          this.dropReadingCount--;
+        }
+
+        const detected = this.dropReadingCount >= this.config.requiredDropReadings;
+        const output = this.result(rawRssi, detected);
+        if (detected && this.config.learnMode) {
+          this.baselineValue = this.smoothValue;
+          this.peakValue = this.smoothValue;
+          this.peakMsValue = timeMs;
+          this.armed = false;
+          this.dropReadingCount = 0;
+        }
+        return output;
+      }
+
+      movingAverage(rawRssi) {
+        this.recent[this.recentNext] = rawRssi;
+        this.recentNext = (this.recentNext + 1) % this.config.movingAverageMeasurements;
+        if (this.recentCount < this.config.movingAverageMeasurements) {
+          this.recentCount++;
+        }
+
+        let total = 0;
+        for (let i = 0; i < this.recentCount; i++) {
+          total += this.recent[i];
+        }
+        return total / this.recentCount;
+      }
+
+      result(rawRssi, peakDetected) {
+        return {
+          hasRssi: this.hasRssiValue,
+          peakDetected,
+          rawRssi,
+          smaRssi: this.smaValue,
+          smoothRssi: this.smoothValue,
+          baselineRssi: this.baselineValue,
+          currentPeakRssi: this.peakValue,
+          currentPeakMs: this.peakMsValue,
+          dropReadings: this.dropReadingCount,
+          peakArmed: this.armed
+        };
+      }
+    }
+
+    const state = {
+      fileName: '',
+      rows: [],
+      points: [],
+      peak: null,
+      armedAt: null,
+      error: '',
+      wasmModule: null,
+      wasmApi: null,
+      wasmLoaded: false,
+      detectorSource: 'JS fallback'
+    };
+
+    const graph = document.getElementById('graph');
+    const statusEl = document.getElementById('status');
+    const controls = {
+      avg: document.getElementById('avgInput'),
+      ema: document.getElementById('emaInput'),
+      rise: document.getElementById('riseInput'),
+      drop: document.getElementById('dropInput'),
+      dropReadings: document.getElementById('dropReadingsInput')
+    };
+
+    function clampInt(value, min, max) {
+      const parsed = Number.parseInt(value, 10);
+      if (!Number.isFinite(parsed)) return min;
+      return Math.max(min, Math.min(max, parsed));
+    }
+
+    function loadWasmDetector() {
+      return new Promise(resolve => {
+        if (window.location.protocol === 'file:') {
+          resolve(null);
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = 'peak_detector_wasm.js';
+        script.async = true;
+        script.onload = async () => {
+          if (typeof createPeakDetectorModule !== 'function') {
+            resolve(null);
+            return;
+          }
+          try {
+            resolve(await createPeakDetectorModule());
+          } catch (error) {
+            console.warn('Failed to initialize WASM peak detector:', error);
+            resolve(null);
+          }
+        };
+        script.onerror = () => resolve(null);
+        document.head.appendChild(script);
+      });
+    }
+
+    function wasmApi() {
+      if (!state.wasmModule) return null;
+      if (state.wasmApi) return state.wasmApi;
+      const module = state.wasmModule;
+      state.wasmApi = {
+        create: module.cwrap('pd_create', 'number', []),
+        destroy: module.cwrap('pd_destroy', null, ['number']),
+        configure: module.cwrap('pd_configure', null, ['number', 'number', 'number', 'number', 'number', 'number', 'number']),
+        reset: module.cwrap('pd_reset', null, ['number', 'number']),
+        process: module.cwrap('pd_process', 'number', ['number', 'number', 'number']),
+        smaRssi: module.cwrap('pd_sma_rssi', 'number', ['number']),
+        smoothRssi: module.cwrap('pd_smooth_rssi', 'number', ['number']),
+        currentPeakRssi: module.cwrap('pd_current_peak_rssi', 'number', ['number']),
+        currentPeakMs: module.cwrap('pd_current_peak_ms', 'number', ['number']),
+        dropReadings: module.cwrap('pd_drop_readings', 'number', ['number']),
+        peakArmed: module.cwrap('pd_peak_armed', 'number', ['number'])
+      };
+      return state.wasmApi;
+    }
+
+    function splitCsvLine(line) {
+      const cells = [];
+      let cell = '';
+      let quoted = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (c === '"') {
+          if (quoted && line[i + 1] === '"') {
+            cell += '"';
+            i++;
+          } else {
+            quoted = !quoted;
+          }
+        } else if (c === ',' && !quoted) {
+          cells.push(cell);
+          cell = '';
+        } else {
+          cell += c;
+        }
+      }
+      cells.push(cell);
+      return cells;
+    }
+
+    function parseCsv(text) {
+      const lines = text.replace(/\r/g, '').split('\n').filter(line => line.trim().length > 0);
+      if (lines.length < 2) {
+        throw new Error('CSV must include a header and at least one data row.');
+      }
+
+      const header = splitCsvLine(lines[0]).map(name => name.trim());
+      const timeColumn = header.indexOf('time_ms');
+      const secondsColumn = header.indexOf('seconds');
+      let rawColumn = header.indexOf('raw_rssi');
+      if (rawColumn < 0) rawColumn = header.indexOf('rssi');
+      if (rawColumn < 0 || (timeColumn < 0 && secondsColumn < 0)) {
+        throw new Error('CSV must include raw_rssi or rssi, and time_ms or seconds columns.');
+      }
+
+      const rows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const cells = splitCsvLine(lines[i]);
+        if (cells.length <= rawColumn) continue;
+
+        const rawRssi = Number(cells[rawColumn]);
+        if (!Number.isFinite(rawRssi)) continue;
+
+        let timeMs = Number.NaN;
+        let seconds = Number.NaN;
+        if (timeColumn >= 0 && cells.length > timeColumn) {
+          timeMs = Number(cells[timeColumn]);
+          seconds = timeMs / 1000;
+        }
+        if (secondsColumn >= 0 && cells.length > secondsColumn) {
+          seconds = Number(cells[secondsColumn]);
+          if (!Number.isFinite(timeMs)) {
+            timeMs = Math.round(seconds * 1000);
+          }
+        }
+        if (!Number.isFinite(timeMs) || !Number.isFinite(seconds)) continue;
+
+        rows.push({ timeMs, seconds, rawRssi });
+      }
+
+      if (rows.length === 0) {
+        throw new Error('No valid RSSI rows found.');
+      }
+      rows.sort((a, b) => a.timeMs - b.timeMs);
+      return rows;
+    }
+
+    function currentConfig() {
+      return {
+        movingAverageMeasurements: clampInt(controls.avg.value, 1, 12),
+        emaAlphaPercent: clampInt(controls.ema.value, 1, 100),
+        peakArmRiseDb: clampInt(controls.rise.value, 1, 30),
+        peakDropDb: clampInt(controls.drop.value, 1, 30),
+        requiredDropReadings: clampInt(controls.dropReadings.value, 1, 20),
+        learnMode: false
+      };
+    }
+
+    function replayWithJsDetector(config) {
+      const detector = new PeakDetector();
+      detector.configure(config);
+      detector.reset(state.rows.length ? state.rows[0].timeMs : 0);
+
+      for (const row of state.rows) {
+        const result = detector.process(row.timeMs, row.rawRssi);
+        recordDetectorResult(row, result);
+      }
+      state.detectorSource = 'JS fallback';
+    }
+
+    function replayWithWasmDetector(config) {
+      const api = wasmApi();
+      if (!api) {
+        replayWithJsDetector(config);
+        return;
+      }
+
+      const handle = api.create();
+      try {
+        api.configure(
+          handle,
+          config.movingAverageMeasurements,
+          config.emaAlphaPercent,
+          config.peakArmRiseDb,
+          config.peakDropDb,
+          config.requiredDropReadings,
+          config.learnMode ? 1 : 0
+        );
+        api.reset(handle, state.rows.length ? state.rows[0].timeMs : 0);
+
+        for (const row of state.rows) {
+          const peakDetected = Boolean(api.process(handle, row.timeMs, row.rawRssi));
+          recordDetectorResult(row, {
+            peakDetected,
+            rawRssi: row.rawRssi,
+            smaRssi: api.smaRssi(handle),
+            smoothRssi: api.smoothRssi(handle),
+            currentPeakRssi: api.currentPeakRssi(handle),
+            currentPeakMs: api.currentPeakMs(handle),
+            dropReadings: api.dropReadings(handle),
+            peakArmed: Boolean(api.peakArmed(handle))
+          });
+        }
+      } finally {
+        api.destroy(handle);
+      }
+      state.detectorSource = 'C++ WASM';
+    }
+
+    function recordDetectorResult(row, result) {
+      const point = {
+        timeMs: row.timeMs,
+        seconds: row.seconds,
+        rawRssi: row.rawRssi,
+        smaRssi: result.smaRssi,
+        smoothRssi: result.smoothRssi,
+        peak: result.peakDetected,
+        peakArmed: result.peakArmed,
+        dropReadings: result.dropReadings
+      };
+      state.points.push(point);
+
+      if (result.peakArmed && !state.armedAt) {
+        state.armedAt = {
+          timeMs: row.timeMs,
+          seconds: row.seconds,
+          rssi: result.smoothRssi
+        };
+      }
+
+      if (result.peakDetected && !state.peak) {
+        state.peak = {
+          timeMs: result.currentPeakMs,
+          seconds: secondsForTimeMs(result.currentPeakMs),
+          rssi: result.currentPeakRssi
+        };
+      }
+    }
+
+    function replay() {
+      state.error = '';
+      state.points = [];
+      state.peak = null;
+      state.armedAt = null;
+
+      const config = currentConfig();
+      if (state.wasmLoaded) {
+        replayWithWasmDetector(config);
+      } else {
+        replayWithJsDetector(config);
+      }
+    }
+
+    function secondsForTimeMs(timeMs) {
+      if (!state.rows.length) return timeMs / 1000;
+      const first = state.rows[0];
+      return first.seconds + (timeMs - first.timeMs) / 1000;
+    }
+
+    function signalLevel(rssi) {
+      const clamped = Math.max(-100, Math.min(-35, rssi));
+      return Math.max(0, Math.min(99, Math.round(((clamped + 100) * 99) / 65)));
+    }
+
+    function map(value, inMin, inMax, outMin, outMax) {
+      return outMin + ((value - inMin) * (outMax - outMin)) / (inMax - inMin);
+    }
+
+    function formatSeconds(seconds) {
+      if (Math.abs(seconds) >= 100) return seconds.toFixed(0) + 's';
+      if (Math.abs(seconds) >= 10) return seconds.toFixed(1) + 's';
+      return seconds.toFixed(2) + 's';
+    }
+
+    function svgEl(name, attrs = {}, text = '') {
+      const el = document.createElementNS('http://www.w3.org/2000/svg', name);
+      Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, String(value)));
+      if (text) el.textContent = text;
+      return el;
+    }
+
+    function drawPolyline(points, key, color, minT, maxT, left, right, top, bottom) {
+      const coordinates = points.map(point => {
+        const x = map(point.seconds, minT, maxT, left, right);
+        const y = map(signalLevel(point[key]), 0, 99, bottom, top);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(' ');
+      graph.appendChild(svgEl('polyline', {
+        points: coordinates,
+        fill: 'none',
+        stroke: color,
+        'stroke-width': 2
+      }));
+    }
+
+    function drawGraph() {
+      graph.replaceChildren();
+      const width = 1100;
+      const height = 520;
+      const left = 58;
+      const right = width - 36;
+      const top = 54;
+      const bottom = height - 54;
+
+      graph.appendChild(svgEl('rect', { x: 0, y: 0, width, height, fill: '#fff' }));
+
+      const title = state.fileName || 'No CSV loaded';
+      graph.appendChild(svgEl('text', {
+        x: 20, y: 24,
+        'font-family': 'system-ui, sans-serif',
+        'font-size': 16,
+        fill: '#20211f'
+      }, title));
+
+      const config = currentConfig();
+      graph.appendChild(svgEl('text', {
+        x: 20, y: 44,
+        'font-family': 'system-ui, sans-serif',
+        'font-size': 13,
+        fill: '#555b52'
+      }, `SMA ${config.movingAverageMeasurements}, EMA ${config.emaAlphaPercent}%, rise ${config.peakArmRiseDb} dB, drop ${config.peakDropDb} dB, drop readings ${config.requiredDropReadings}`));
+
+      for (let level = 10; level <= 90; level += 10) {
+        const y = map(level, 0, 99, bottom, top);
+        graph.appendChild(svgEl('line', {
+          x1: left, y1: y, x2: right, y2: y,
+          stroke: '#e1e4df'
+        }));
+        graph.appendChild(svgEl('text', {
+          x: 22, y: y + 4,
+          'font-family': 'system-ui, sans-serif',
+          'font-size': 12,
+          fill: '#495047'
+        }, String(level)));
+      }
+
+      graph.appendChild(svgEl('text', {
+        x: 20, y: height - 18,
+        'font-family': 'system-ui, sans-serif',
+        'font-size': 12,
+        fill: '#495047'
+      }, 'signal 0-99'));
+
+      if (!state.points.length) return;
+
+      const minT = state.points[0].seconds;
+      const maxT = Math.max(state.points[state.points.length - 1].seconds, minT + 1);
+      let armedStart = null;
+      for (let i = 0; i <= state.points.length; i++) {
+        const point = state.points[i];
+        if (point && point.peakArmed && armedStart === null) {
+          armedStart = point.seconds;
+        }
+        if ((!point || !point.peakArmed) && armedStart !== null) {
+          const armedEnd = point ? point.seconds : state.points[state.points.length - 1].seconds;
+          const x = map(armedStart, minT, maxT, left, right);
+          const width = Math.max(1, map(armedEnd, minT, maxT, left, right) - x);
+          graph.appendChild(svgEl('rect', {
+            x, y: top,
+            width,
+            height: bottom - top,
+            fill: '#7c3aed',
+            opacity: 0.08
+          }));
+          armedStart = null;
+        }
+      }
+      const tickCount = 6;
+      for (let i = 0; i <= tickCount; i++) {
+        const seconds = minT + ((maxT - minT) * i) / tickCount;
+        const x = map(seconds, minT, maxT, left, right);
+        graph.appendChild(svgEl('line', {
+          x1: x, y1: top, x2: x, y2: bottom,
+          stroke: '#edf0eb'
+        }));
+        graph.appendChild(svgEl('line', {
+          x1: x, y1: bottom, x2: x, y2: bottom + 6,
+          stroke: '#9aa299'
+        }));
+        graph.appendChild(svgEl('text', {
+          x, y: bottom + 22,
+          'font-family': 'system-ui, sans-serif',
+          'font-size': 12,
+          'text-anchor': i === 0 ? 'start' : (i === tickCount ? 'end' : 'middle'),
+          fill: '#495047'
+        }, formatSeconds(seconds)));
+      }
+      graph.appendChild(svgEl('text', {
+        x: right, y: height - 18,
+        'font-family': 'system-ui, sans-serif',
+        'font-size': 12,
+        'text-anchor': 'end',
+        fill: '#495047'
+      }, 'time'));
+
+      if (state.armedAt) {
+        const x = map(state.armedAt.seconds, minT, maxT, left, right);
+        graph.appendChild(svgEl('line', {
+          x1: x, y1: top, x2: x, y2: bottom,
+          stroke: '#7c3aed',
+          'stroke-width': 2,
+          'stroke-dasharray': '5 5'
+        }));
+        graph.appendChild(svgEl('text', {
+          x: Math.min(Math.max(x + 8, left + 4), right - 170),
+          y: 92,
+          'font-family': 'system-ui, sans-serif',
+          'font-size': 14,
+          fill: '#7c3aed'
+        }, `Armed ${state.armedAt.seconds.toFixed(3)} s`));
+      }
+
+      drawPolyline(state.points, 'rawRssi', '#1f6feb', minT, maxT, left, right, top, bottom);
+      drawPolyline(state.points, 'smaRssi', '#1a7f37', minT, maxT, left, right, top, bottom);
+      drawPolyline(state.points, 'smoothRssi', '#d1242f', minT, maxT, left, right, top, bottom);
+
+      if (state.peak) {
+        const x = map(state.peak.seconds, minT, maxT, left, right);
+        graph.appendChild(svgEl('line', {
+          x1: x, y1: top, x2: x, y2: bottom,
+          stroke: '#7a5c00',
+          'stroke-width': 2
+        }));
+        graph.appendChild(svgEl('text', {
+          x: Math.min(Math.max(x + 8, left + 4), right - 180),
+          y: 72,
+          'font-family': 'system-ui, sans-serif',
+          'font-size': 15,
+          fill: '#7a5c00'
+        }, `Peak ${state.peak.seconds.toFixed(3)} s, ${state.peak.rssi.toFixed(1)} dBm`));
+      }
+    }
+
+    function renderStatus() {
+      const config = currentConfig();
+      if (state.error) {
+        statusEl.innerHTML = `<div class="error">${escapeHtml(state.error)}</div>`;
+        return;
+      }
+      if (!state.rows.length) {
+        statusEl.innerHTML = `<div>Waiting for CSV</div><div>Detector: <strong>${escapeHtml(state.detectorSource)}</strong></div>`;
+        return;
+      }
+
+      const duration = state.points.length
+        ? state.points[state.points.length - 1].seconds - state.points[0].seconds
+        : 0;
+      const peakText = state.peak
+        ? `Peak: ${state.peak.seconds.toFixed(3)} s (${state.peak.rssi.toFixed(1)} dBm, signal ${signalLevel(state.peak.rssi)})`
+        : 'Peak: none';
+      const armedText = state.armedAt
+        ? `Armed: ${state.armedAt.seconds.toFixed(3)} s`
+        : 'Armed: no';
+      statusEl.innerHTML = [
+        `<div>Samples: <strong>${state.points.length}</strong></div>`,
+        `<div>Duration: <strong>${duration.toFixed(2)} s</strong></div>`,
+        `<div>Detector: <strong>${escapeHtml(state.detectorSource)}</strong></div>`,
+        `<div>${armedText}</div>`,
+        `<div>${peakText}</div>`,
+        `<div>Config: <strong>SMA ${config.movingAverageMeasurements}, EMA ${config.emaAlphaPercent}%, rise ${config.peakArmRiseDb}, drop ${config.peakDropDb}, readings ${config.requiredDropReadings}</strong></div>`
+      ].join('');
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function rerender() {
+      updateOutputs();
+      if (state.rows.length) replay();
+      renderStatus();
+      drawGraph();
+    }
+
+    function updateOutputs() {
+      document.getElementById('avgOut').value = controls.avg.value;
+      document.getElementById('emaOut').value = controls.ema.value;
+      document.getElementById('riseOut').value = controls.rise.value;
+      document.getElementById('dropOut').value = controls.drop.value;
+      document.getElementById('dropReadingsOut').value = controls.dropReadings.value;
+    }
+
+    document.getElementById('fileInput').addEventListener('change', async event => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+        state.fileName = file.name;
+        state.rows = parseCsv(text);
+        state.error = '';
+      } catch (error) {
+        state.fileName = file.name;
+        state.rows = [];
+        state.points = [];
+        state.peak = null;
+        state.armedAt = null;
+        state.error = error.message || String(error);
+      }
+      rerender();
+    });
+
+    Object.values(controls).forEach(input => input.addEventListener('input', rerender));
+    rerender();
+    loadWasmDetector().then(module => {
+      if (!module) return;
+      state.wasmModule = module;
+      state.wasmLoaded = true;
+      state.detectorSource = 'C++ WASM';
+      rerender();
+    });
+  </script>
+</body>
+</html>
